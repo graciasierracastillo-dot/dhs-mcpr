@@ -2,5 +2,9 @@
 .DS_Store
 Rplots.pdf
 .Rproj.user/
-.rsconnect/
 *.Rproj
+**/rsconnect/
+*_cache/
+*_files/
+*_check.md
+dashboard_assets/manifest.csv

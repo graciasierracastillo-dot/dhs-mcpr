@@ -1,0 +1,705 @@
+---
+title: "Bayesian Hierarchical GAMM for mCPR"
+subtitle: "DHS country trajectories, 2026 growth-headroom investment staging"
+author: "Analytics Team"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+options(mc.cores = max(1, parallel::detectCores() - 1))
+```
+
+# Executive Summary
+
+This report fits a **Bayesian hierarchical GAMM** to DHS mCPR data by country and year, then uses **2026 model-based predictions** to classify countries into investment stages.
+
+Core outputs:
+
+- Country-level fitted mCPR trajectories with uncertainty
+- Growth (
+\(\frac{dp}{dt}\)
+) and acceleration (
+\(\frac{d^2p}{dt^2}\)
+) patterns
+- Implicit country saturation proxy and 2026 headroom
+- Investment-stage classification and priority ranking for 2026 decisions
+
+# Modeling Objective
+
+For country \(i\) in survey year \(t\), let:
+
+- \(y_{it}\): number of women using modern contraception
+- \(n_{it}\): number of women observed
+- \(p_{it}\): modern method prevalence probability
+
+Likelihood:
+
+\[
+y_{it} \sim \text{Binomial}(n_{it}, p_{it})
+\]
+
+Hierarchical additive predictor:
+
+\[
+\text{logit}(p_{it}) = \beta_0 + b_{0i} + f_0(t) + f_i(t)
+\]
+
+where:
+
+- \(f_0(t)\): global smooth over time
+- \(f_i(t)\): country-specific smooth deviation (factor-smooth)
+- \(b_{0i} \sim \mathcal{N}(0, \sigma_b)\): country random intercept
+
+This formulation keeps the outcome in **binomial space** (no pre-logit transformed response), which is the correct setup for `brms` with `family = binomial(link = "logit")`.
+
+# Libraries
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(brms)
+library(posterior)
+library(DT)
+library(scales)
+```
+
+# Data Preparation
+
+```{r load-and-prepare-data}
+# Expected columns: country, year, mCPR (0-1), n_women
+mcpr_raw <- read.csv("mcpr_data.csv", stringsAsFactors = FALSE)
+
+required_cols <- c("country", "year", "mCPR", "n_women")
+stopifnot(all(required_cols %in% names(mcpr_raw)))
+
+mcpr_dat <- mcpr_raw %>%
+  transmute(
+    country = factor(country),
+    year = as.numeric(year),
+    mCPR = as.numeric(mCPR),
+    n = as.integer(round(n_women))
+  ) %>%
+  mutate(
+    mCPR = pmin(pmax(mCPR, 1e-6), 1 - 1e-6),
+    y = as.integer(round(mCPR * n))
+  ) %>%
+  filter(!is.na(country), !is.na(year), !is.na(y), !is.na(n), n > 0, y >= 0, y <= n) %>%
+  arrange(country, year)
+
+YEAR_REF <- 2000
+DECISION_YEAR <- 2026
+GRID_STEP <- 0.5
+HORIZON_YEAR <- max(DECISION_YEAR + 10, max(mcpr_dat$year, na.rm = TRUE) + 6)
+
+mcpr_dat <- mcpr_dat %>%
+  mutate(
+    year_c = year - YEAR_REF,
+    obs_prop = y / n
+  )
+
+cat("Rows:", nrow(mcpr_dat), "\n")
+cat("Countries:", n_distinct(mcpr_dat$country), "\n")
+cat("Year range:", min(mcpr_dat$year), "to", max(mcpr_dat$year), "\n")
+cat("Decision year:", DECISION_YEAR, "\n")
+```
+
+```{r data-coverage-table}
+mcpr_dat %>%
+  group_by(country) %>%
+  summarise(
+    surveys = n(),
+    first_year = min(year),
+    last_year = max(year),
+    min_mCPR = min(obs_prop),
+    max_mCPR = max(obs_prop),
+    .groups = "drop"
+  ) %>%
+  arrange(country) %>%
+  DT::datatable(
+    caption = "Country survey coverage",
+    options = list(pageLength = 12, scrollX = TRUE),
+    rownames = FALSE
+  )
+```
+
+# Initial Global Shape and Dynamics (Descriptive)
+
+This section gives an initial (non-model) view of global shape and acceleration/deceleration using country-year means.
+
+```{r descriptive-global-shape}
+global_obs <- mcpr_dat %>%
+  group_by(year) %>%
+  summarise(
+    mean_mcpr = mean(obs_prop),
+    .groups = "drop"
+  ) %>%
+  arrange(year) %>%
+  mutate(
+    d1 = (lead(mean_mcpr) - lag(mean_mcpr)) / (lead(year) - lag(year)),
+    d2 = (lead(mean_mcpr) - 2 * mean_mcpr + lag(mean_mcpr)) / (((lead(year) - lag(year)) / 2)^2)
+  )
+
+ggplot(global_obs, aes(x = year, y = mean_mcpr)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Descriptive global mCPR shape (country-average)",
+    x = "Year",
+    y = "Mean observed mCPR"
+  )
+```
+
+```{r descriptive-global-dynamics}
+global_dyn <- global_obs %>%
+  select(year, d1, d2) %>%
+  pivot_longer(cols = c(d1, d2), names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric = recode(metric, d1 = "First derivative (growth)", d2 = "Second derivative (acceleration)")
+  )
+
+ggplot(global_dyn, aes(x = year, y = value)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Descriptive global growth and acceleration signals",
+    x = "Year",
+    y = "Value"
+  )
+```
+
+# Bayesian Hierarchical GAMM
+
+## Formula
+
+```{r model-formula}
+bgam_formula <- bf(
+  y | trials(n) ~ 1 +
+    (1 | country) +
+    s(year_c, k = 10) +
+    s(year_c, by = country, bs = "fs", k = 6)
+)
+
+bgam_formula
+```
+
+## Priors
+
+We center the intercept prior at the weighted global observed mCPR:
+
+\[
+\mu_0 = \text{logit}\left(\frac{\sum y}{\sum n}\right)
+\]
+
+Priors:
+
+- \(\beta_0 \sim \mathcal{N}(\mu_0, 1.5)\)
+- \(\sigma_b \sim \mathcal{N}^+(0, 1)\)
+- spline SDs \(\sim t^+_{\nu=3}(0, 1.5)\)
+
+```{r model-priors}
+p_bar <- with(mcpr_dat, sum(y) / sum(n))
+p_bar <- pmin(pmax(p_bar, 1e-4), 1 - 1e-4)
+mu0 <- qlogis(p_bar)
+
+bgam_priors <- c(
+  set_prior(sprintf("normal(%0.8f, 1.5)", mu0), class = "Intercept"),
+  prior(normal(0, 1), class = "sd", group = "country"),
+  prior(student_t(3, 0, 1.5), class = "sds")
+)
+
+cat("Weighted p_bar =", round(p_bar, 4), "| logit center mu0 =", round(mu0, 3), "\n")
+```
+
+## Fit
+
+```{r fit-model, cache=TRUE}
+fit_path <- "fit_bgam_mcpr_2026.rds"
+
+if (file.exists(fit_path)) {
+  fit_bgam <- readRDS(fit_path)
+} else {
+  fit_bgam <- brm(
+    formula = bgam_formula,
+    data = mcpr_dat,
+    family = binomial(link = "logit"),
+    prior = bgam_priors,
+    chains = 4,
+    iter = 2500,
+    warmup = 1250,
+    seed = 123,
+    control = list(adapt_delta = 0.995, max_treedepth = 15),
+    save_pars = save_pars(all = TRUE)
+  )
+  saveRDS(fit_bgam, fit_path)
+}
+```
+
+```{r fit-summary}
+summary(fit_bgam)
+```
+
+# Diagnostics
+
+```{r diagnostics-plot}
+plot(fit_bgam)
+```
+
+```{r posterior-predictive-checks}
+pp_check(fit_bgam, type = "bars", ndraws = 200)
+pp_check(fit_bgam, type = "error_hist", ndraws = 200)
+```
+
+# Fitted Values and Residual Checks
+
+```{r fitted-values}
+ep_obs <- posterior_epred(fit_bgam, ndraws = 500)
+p_hat <- colMeans(ep_obs)
+
+mcpr_fit <- mcpr_dat %>%
+  mutate(
+    p_hat = p_hat,
+    resid_raw = obs_prop - p_hat,
+    p_clip = pmin(pmax(p_hat, 1e-6), 1 - 1e-6),
+    resid_pearson = (y - n * p_hat) / sqrt(n * p_clip * (1 - p_clip))
+  )
+
+summary(mcpr_fit$p_hat)
+summary(mcpr_fit$resid_pearson)
+```
+
+```{r residual-plots}
+p1 <- ggplot(mcpr_fit, aes(x = year, y = resid_pearson)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Pearson residuals vs year", x = "Year", y = "Pearson residual")
+
+p2 <- ggplot(mcpr_fit, aes(x = p_hat, y = resid_pearson)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Pearson residuals vs fitted", x = "Fitted mCPR", y = "Pearson residual")
+
+p1
+p2
+```
+
+# Prediction Grids and Derivative Utilities
+
+```{r helper-functions}
+finite_diff <- function(mat, h) {
+  # mat: draws x time
+  n_t <- ncol(mat)
+  d1 <- matrix(NA_real_, nrow(mat), n_t)
+  d2 <- matrix(NA_real_, nrow(mat), n_t)
+  if (n_t >= 3) {
+    d1[, 2:(n_t - 1)] <- (mat[, 3:n_t, drop = FALSE] - mat[, 1:(n_t - 2), drop = FALSE]) / (2 * h)
+    d2[, 2:(n_t - 1)] <- (mat[, 3:n_t, drop = FALSE] - 2 * mat[, 2:(n_t - 1), drop = FALSE] + mat[, 1:(n_t - 2), drop = FALSE]) / (h^2)
+  }
+  list(d1 = d1, d2 = d2)
+}
+
+summarize_draw_matrix <- function(mat, probs = c(0.05, 0.5, 0.95)) {
+  tibble(
+    q05 = apply(mat, 2, quantile, probs = probs[1], na.rm = TRUE),
+    q50 = apply(mat, 2, quantile, probs = probs[2], na.rm = TRUE),
+    q95 = apply(mat, 2, quantile, probs = probs[3], na.rm = TRUE)
+  )
+}
+
+rescale_safe <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!all(is.finite(rng)) || diff(rng) == 0) {
+    return(rep(0, length(x)))
+  }
+  (x - rng[1]) / diff(rng)
+}
+```
+
+# Global Model-Based Shape, Growth, and Acceleration
+
+```{r global-grid-and-predictions, cache=TRUE}
+year_seq_global <- seq(min(mcpr_dat$year), DECISION_YEAR, by = GRID_STEP)
+
+global_grid <- tidyr::crossing(
+  country = levels(mcpr_dat$country),
+  year = year_seq_global
+) %>%
+  mutate(
+    year_c = year - YEAR_REF,
+    n = 1L
+  )
+
+ep_global <- posterior_epred(fit_bgam, newdata = global_grid, ndraws = 500)
+
+idx_by_year <- split(seq_len(nrow(global_grid)), global_grid$year)
+
+global_draws <- sapply(idx_by_year, function(idx) {
+  rowMeans(ep_global[, idx, drop = FALSE])
+})
+
+global_draws <- as.matrix(global_draws)
+colnames(global_draws) <- names(idx_by_year)
+
+global_der <- finite_diff(global_draws, h = GRID_STEP)
+
+global_summ <- bind_cols(
+  tibble(year = as.numeric(colnames(global_draws))),
+  summarize_draw_matrix(global_draws) %>% rename(p05 = q05, p50 = q50, p95 = q95),
+  summarize_draw_matrix(global_der$d1) %>% rename(dp05 = q05, dp50 = q50, dp95 = q95),
+  summarize_draw_matrix(global_der$d2) %>% rename(d205 = q05, d250 = q50, d295 = q95)
+)
+```
+
+```{r global-shape-plot}
+ggplot(global_summ, aes(x = year, y = p50)) +
+  geom_ribbon(aes(ymin = p05, ymax = p95), alpha = 0.25) +
+  geom_line(linewidth = 1) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Global model-based mCPR trajectory (country-average)",
+    subtitle = "Median and 90% credible interval",
+    x = "Year",
+    y = "mCPR"
+  )
+```
+
+```{r global-derivative-plot}
+global_der_long <- global_summ %>%
+  select(year, dp05, dp50, dp95, d205, d250, d295) %>%
+  mutate(
+    growth = dp50,
+    growth_lo = dp05,
+    growth_hi = dp95,
+    accel = d250,
+    accel_lo = d205,
+    accel_hi = d295
+  )
+
+p_growth <- ggplot(global_der_long, aes(x = year, y = growth)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_ribbon(aes(ymin = growth_lo, ymax = growth_hi), alpha = 0.25) +
+  geom_line(linewidth = 0.9) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Global growth (dp/dt)", x = "Year", y = "mCPR per year")
+
+p_accel <- ggplot(global_der_long, aes(x = year, y = accel)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_ribbon(aes(ymin = accel_lo, ymax = accel_hi), alpha = 0.25) +
+  geom_line(linewidth = 0.9) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Global acceleration (d2p/dt2)", x = "Year", y = "mCPR per year^2")
+
+p_growth
+p_accel
+```
+
+# Country Curves, Growth, and Acceleration
+
+```{r country-grid-predictions, cache=TRUE}
+year_seq_country <- seq(min(mcpr_dat$year), HORIZON_YEAR, by = GRID_STEP)
+
+country_grid <- tidyr::crossing(
+  country = levels(mcpr_dat$country),
+  year = year_seq_country
+) %>%
+  mutate(
+    year_c = year - YEAR_REF,
+    n = 1L
+  ) %>%
+  arrange(country, year)
+
+ep_country <- posterior_epred(fit_bgam, newdata = country_grid, ndraws = 500)
+
+idx_by_country <- split(seq_len(nrow(country_grid)), country_grid$country)
+
+country_curve <- map_dfr(names(idx_by_country), function(cty) {
+  idx <- idx_by_country[[cty]]
+  yr <- country_grid$year[idx]
+  mat <- ep_country[, idx, drop = FALSE]
+  der <- finite_diff(mat, h = GRID_STEP)
+
+  bind_cols(
+    tibble(country = cty, year = yr),
+    summarize_draw_matrix(mat) %>% rename(p05 = q05, p50 = q50, p95 = q95),
+    summarize_draw_matrix(der$d1) %>% rename(dp05 = q05, dp50 = q50, dp95 = q95),
+    summarize_draw_matrix(der$d2) %>% rename(d205 = q05, d250 = q50, d295 = q95)
+  )
+}) %>%
+  mutate(country = factor(country, levels = levels(mcpr_dat$country)))
+```
+
+```{r country-fits-facet, fig.width=14, fig.height=18}
+plot_data_fit <- country_curve %>% filter(year <= DECISION_YEAR)
+
+ggplot(plot_data_fit, aes(x = year, y = p50)) +
+  geom_ribbon(aes(ymin = p05, ymax = p95), alpha = 0.2) +
+  geom_line(linewidth = 0.7) +
+  geom_point(data = mcpr_dat, aes(x = year, y = obs_prop), inherit.aes = FALSE, alpha = 0.5, size = 1.2) +
+  facet_wrap(~ country, scales = "free_x", ncol = 5) +
+  theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(size = 8, face = "bold")) +
+  labs(
+    title = "Country-level Bayesian GAMM fitted trajectories",
+    subtitle = "Observed points + posterior median and 90% CrI",
+    x = "Year",
+    y = "mCPR"
+  )
+```
+
+```{r country-growth-accel-facet, fig.width=14, fig.height=18}
+plot_data_dyn <- country_curve %>% filter(year <= DECISION_YEAR)
+
+p_ctry_growth <- ggplot(plot_data_dyn, aes(x = year, y = dp50)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_ribbon(aes(ymin = dp05, ymax = dp95), alpha = 0.2) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ country, scales = "free_x", ncol = 5) +
+  theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(size = 8, face = "bold")) +
+  labs(title = "Country growth dp/dt", x = "Year", y = "mCPR per year")
+
+p_ctry_accel <- ggplot(plot_data_dyn, aes(x = year, y = d250)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_ribbon(aes(ymin = d205, ymax = d295), alpha = 0.2) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ country, scales = "free_x", ncol = 5) +
+  theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(size = 8, face = "bold")) +
+  labs(title = "Country acceleration d2p/dt2", x = "Year", y = "mCPR per year^2")
+
+p_ctry_growth
+p_ctry_accel
+```
+
+# 2026 Decision Metrics
+
+We classify investment stage using **model predictions at 2026**.
+
+Definitions by country \(i\):
+
+- Current level: \(\hat{p}_{i,2026}\)
+- Current growth: \(\widehat{dp/dt}_{i,2026}\)
+- Implicit ceiling proxy: \(\hat{K}_i = Q_{0.95}\left(\hat{p}_i(t),\ t \in [2026, \text{horizon}]\right)\)
+- Headroom: \(\hat{h}_i = \max(\hat{K}_i - \hat{p}_{i,2026}, 0)\)
+
+```{r decision-metrics-2026}
+country_2026 <- country_curve %>%
+  group_by(country) %>%
+  filter(abs(year - DECISION_YEAR) == min(abs(year - DECISION_YEAR))) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    country,
+    year_decision = DECISION_YEAR,
+    p2026 = p50,
+    p2026_lo = p05,
+    p2026_hi = p95,
+    growth2026 = dp50,
+    growth2026_lo = dp05,
+    growth2026_hi = dp95,
+    accel2026 = d250,
+    accel2026_lo = d205,
+    accel2026_hi = d295
+  )
+
+country_ceiling <- country_curve %>%
+  filter(year >= DECISION_YEAR) %>%
+  group_by(country) %>%
+  summarise(
+    K90 = quantile(p50, 0.90, na.rm = TRUE),
+    K95 = quantile(p50, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+country_status <- country_2026 %>%
+  left_join(country_ceiling, by = "country") %>%
+  mutate(
+    headroom = pmax(K95 - p2026, 0),
+    rel_saturation = p2026 / pmax(K95, 1e-6)
+  )
+
+summary(country_status$headroom)
+summary(country_status$growth2026)
+```
+
+# Investment Stage Classification (2026)
+
+Classification is based on joint growth-headroom position:
+
+- High growth + high headroom: strongest scale-up potential
+- Mixed profile: targeted strategy and constraint-specific support
+- Low growth + low headroom: maintenance/equity focus
+
+```{r stage-classification}
+growth_cut <- quantile(country_status$growth2026, 2/3, na.rm = TRUE)
+headroom_cut <- quantile(country_status$headroom, 2/3, na.rm = TRUE)
+
+country_stage <- country_status %>%
+  mutate(
+    growth_norm = rescale_safe(pmax(growth2026, 0)),
+    headroom_norm = rescale_safe(headroom),
+    accel_bonus = ifelse(accel2026 > 0, 0.10, 0),
+    priority_score = 100 * pmin(1, pmax(0, 0.60 * growth_norm + 0.40 * headroom_norm + accel_bonus)),
+    stage = case_when(
+      growth2026 >= growth_cut & headroom >= headroom_cut ~ "Stage 1: Accelerate investment",
+      growth2026 < growth_cut & headroom < headroom_cut ~ "Stage 3: Sustain and equity",
+      TRUE ~ "Stage 2: Targeted scale-up"
+    ),
+    stage_rank = case_when(
+      stage == "Stage 1: Accelerate investment" ~ 1L,
+      stage == "Stage 2: Targeted scale-up" ~ 2L,
+      TRUE ~ 3L
+    ),
+    accel_label = case_when(
+      accel2026 > 0 ~ "Accelerating",
+      accel2026 < 0 ~ "Decelerating",
+      TRUE ~ "Flat"
+    )
+  ) %>%
+  arrange(stage_rank, desc(priority_score))
+
+cat("Growth cut (67th pct):", round(growth_cut, 4), "\n")
+cat("Headroom cut (67th pct):", round(headroom_cut, 4), "\n")
+```
+
+# 2026 Investment Ranking Table
+
+```{r ranking-table}
+investment_table <- country_stage %>%
+  transmute(
+    country,
+    stage,
+    stage_rank,
+    priority_score,
+    p2026,
+    p2026_lo,
+    p2026_hi,
+    growth2026,
+    growth2026_lo,
+    growth2026_hi,
+    accel2026,
+    accel_label,
+    K90,
+    K95,
+    headroom,
+    rel_saturation
+  ) %>%
+  arrange(stage_rank, desc(priority_score))
+
+DT::datatable(
+  investment_table %>% mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "Country investment staging and priority (decision year = 2026)",
+  filter = "top",
+  options = list(pageLength = 25, scrollX = TRUE),
+  rownames = FALSE
+)
+```
+
+# Investment Visualizations
+
+```{r stage-count-plot}
+stage_counts <- country_stage %>%
+  count(stage, stage_rank) %>%
+  arrange(stage_rank)
+
+ggplot(stage_counts, aes(x = reorder(stage, stage_rank), y = n, fill = stage)) +
+  geom_col(alpha = 0.9, show.legend = FALSE) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Countries by investment stage (2026)",
+    x = NULL,
+    y = "Number of countries"
+  )
+```
+
+```{r headroom-growth-scatter}
+ggplot(country_stage, aes(x = growth2026, y = headroom, color = stage, size = priority_score)) +
+  geom_vline(xintercept = growth_cut, linetype = "dashed", alpha = 0.7) +
+  geom_hline(yintercept = headroom_cut, linetype = "dashed", alpha = 0.7) +
+  geom_point(alpha = 0.85) +
+  theme_minimal(base_size = 12) +
+  scale_size_continuous(range = c(2, 8)) +
+  labs(
+    title = "2026 growth vs headroom investment map",
+    subtitle = "Top-right quadrant = strongest scale-up profile",
+    x = "Growth at 2026 (dp/dt)",
+    y = "Headroom (K95 - p2026)",
+    color = NULL,
+    size = "Priority"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+```{r selected-country-trajectories}
+selected_countries <- country_stage %>%
+  group_by(stage) %>%
+  arrange(desc(priority_score), .by_group = TRUE) %>%
+  slice_head(n = 3) %>%
+  ungroup() %>%
+  pull(country)
+
+selected_curve <- country_curve %>%
+  filter(country %in% selected_countries, year <= DECISION_YEAR)
+
+selected_stage <- country_stage %>%
+  select(country, stage, priority_score)
+
+selected_obs <- mcpr_dat %>%
+  filter(country %in% selected_countries)
+
+ggplot(selected_curve, aes(x = year, y = p50)) +
+  geom_ribbon(aes(ymin = p05, ymax = p95), alpha = 0.2) +
+  geom_line(linewidth = 0.9) +
+  geom_point(data = selected_obs, aes(x = year, y = obs_prop), inherit.aes = FALSE, alpha = 0.6, size = 1.5) +
+  geom_vline(xintercept = DECISION_YEAR, linetype = "dotted") +
+  facet_wrap(~ country, scales = "free_y") +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Illustrative countries by investment stage",
+    subtitle = "Top-priority examples per stage",
+    x = "Year",
+    y = "mCPR"
+  )
+```
+
+# Interpretation Notes
+
+- Stage 1 countries combine **high current growth** and **substantial headroom** in 2026, making them strongest candidates for marginal investment returns.
+- Stage 2 countries have one strong dimension (growth or headroom), indicating targeted rather than broad scale-up.
+- Stage 3 countries are relatively saturated and/or slow-growing by 2026, shifting emphasis toward maintenance, quality, and equity.
+
+# Technical Appendix
+
+```{r session-info}
+cat("R:", R.version.string, "\n")
+cat("brms:", as.character(packageVersion("brms")), "\n")
+cat("posterior:", as.character(packageVersion("posterior")), "\n")
+```

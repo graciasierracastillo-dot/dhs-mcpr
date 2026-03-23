@@ -1,8 +1,11 @@
 .git
-.gitignore
 .Rhistory
 .DS_Store
 Rplots.pdf
-get_dhs.Rmd
+analysis
+data_pipeline
 scripts
 README.md
+.gitignore
+.rscignore
+shiny_dashboard/rsconnect

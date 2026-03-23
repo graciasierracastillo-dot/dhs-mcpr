@@ -20,8 +20,12 @@ suppressPackageStartupMessages({
 })
 
 wpp_path <- file.path(project_root, "WPP2024_POP_F01_3_POPULATION_SINGLE_AGE_FEMALE.xlsx")
-mcpr_path <- file.path(project_root, "mcpr_data.csv")
-output_path <- file.path(project_root, "country_pop_weights_15_49.csv")
+mcpr_path <- if (file.exists(file.path(project_root, "mcpr_data.csv"))) {
+  file.path(project_root, "mcpr_data.csv")
+} else {
+  file.path(project_root, "dashboard_assets", "inputs", "mcpr_data.csv")
+}
+output_path <- file.path(project_root, "dashboard_assets", "inputs", "country_pop_weights_15_49.csv")
 
 region_lookup <- c(
   "Cambodia" = "East Asia and Pacific",

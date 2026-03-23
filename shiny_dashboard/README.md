@@ -1,6 +1,6 @@
 # Shiny Dashboard
 
-This folder contains the deployable Shiny application for the DHS mCPR dashboard.
+This folder contains the deployable Shiny application for the DHS mCPR analysis project.
 
 ## Main files
 
@@ -56,3 +56,5 @@ From the repository root:
 ```r
 shiny::runApp("shiny_dashboard")
 ```
+
+This app is intended to sit beside the main analysis reports rather than replace them. The R Markdown analyses produce the saved outputs, and the app provides an interactive layer on top of those exported results.
