@@ -113,6 +113,18 @@ rsconnect::deployApp(
 )
 ```
 
+## Downloadable handoff bundle
+
+If you just want a portable copy for another Windows laptop, use [`dhs_app_handoff/`](dhs_app_handoff/).
+
+That folder includes:
+
+- a minimal saved-asset copy of the app
+- one-click package install scripts
+- one-click local launch scripts
+
+It is meant for local handoff and download, not for GitHub Pages hosting.
+
 ## What is intentionally not included
 
 This repository is organized around the main analytical tasks and app workflow, but it is not the entire working directory. It does not include:
