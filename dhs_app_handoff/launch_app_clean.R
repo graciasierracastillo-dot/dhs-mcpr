@@ -23,7 +23,7 @@ setwd(project_root)
 .libPaths(c(project_lib, .libPaths()))
 
 required_packages <- c(
-  "shiny", "dplyr", "tidyr", "ggplot2", "plotly", "DT", "brms",
+  "shiny", "dplyr", "tidyr", "ggplot2", "ggrepel", "plotly", "DT", "brms",
   "posterior", "readr", "htmltools", "scales", "stringr", "purrr"
 )
 
